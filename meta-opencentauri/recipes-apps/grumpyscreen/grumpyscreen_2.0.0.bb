@@ -13,10 +13,11 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 SRC_URI = "gitsm://github.com/pellcorp/grumpyscreen.git;protocol=https;branch=main \
     file://grumpyscreen.init \
     file://grumpyscreen.cfg \
+    file://0001-show-filament-loading-status.patch \
 "
 
 SRCREV = "33a3e576076e8a7c436fbd7c534cd73af7fe4c44"
-PR = "321"
+PR = "322"
 
 RDEPENDS:${PN} = " \
     klipper \

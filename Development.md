@@ -187,6 +187,35 @@ For installing to internal eMMC storage, use the signed archive installation:
   service klipper restart
   ```
 
+## Filament-loading status
+
+Grumpyscreen displays live nozzle and target temperatures, the filament-switch
+sensor state, and time in the current step on the COSMOS filament-loading
+prompts. An interrupted loading prompt closes if Klipper or Moonraker
+disconnects, discarding its cached readings and buttons. The macros identify
+homing, movement to the purge tray, heating,
+insertion, purging, and final cleanup. The purge message shows the commanded
+length and speed; it does not measure how much filament exits the nozzle.
+The filament-switch sensor reports presence at the sensor, not at the nozzle.
+
+The screen change is applied to the pinned Grumpyscreen source by
+`recipes-apps/grumpyscreen/files/0001-show-filament-loading-status.patch` in
+`meta-opencentauri`. Both that recipe and the updated Klipper macros must be
+included in the firmware build. Editing `cosmos.conf` alone does not install it.
+
+Run the macro regression tests from the repository root with Python and Jinja2:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The Grumpyscreen patch also adds readout tests to its upstream `make test`
+target. On a CC1, verify that temperatures keep updating during heating, each
+step is identified, the insertion and purge buttons work, and cancel turns off
+the nozzle heater. Check loading both while idle and while a print is paused.
+Also verify that a disconnect closes the loading prompt and that a new
+loading flow after reconnect shows fresh target and sensor values.
+
 ## Troubleshooting Build Issues
 
 ### Clean Build

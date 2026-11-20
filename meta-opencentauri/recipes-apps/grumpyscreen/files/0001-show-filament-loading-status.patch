@@ -1,0 +1,301 @@
+From: COSMOS contributors
+Subject: [PATCH] Show live status on filament-loading prompts
+
+Keep nozzle/target temperatures, filament-switch state and step time visible
+while COSMOS loading prompts are open. Refresh a small local status snapshot
+from Moonraker deltas under the LVGL lock, and update the elapsed time once
+per second without rebuilding the prompt or its buttons. Close interrupted
+loading prompts when Klipper or Moonraker disconnects to discard stale data.
+
+Upstream-Status: Inappropriate [COSMOS-specific filament-loading prompts]
+
+diff --git a/Makefile b/Makefile
+--- a/Makefile
++++ b/Makefile
+@@ -239,6 +239,8 @@
+ 	@mkdir -p $(BUILD_DIR)
+ 	g++ -std=gnu++17 -O2 -I./src -I$(DEPS_DIR)/include/ tests/test_config.cpp -o $(BUILD_DIR)/test_config
+ 	$(BUILD_DIR)/test_config
++	g++ -std=gnu++17 -O2 -I./src -I$(DEPS_DIR)/include/ tests/test_filament_prompt.cpp -o $(BUILD_DIR)/test_filament_prompt
++	$(BUILD_DIR)/test_filament_prompt
+ # the backend fixture stubs State and the websocket client, so it links
+ # only the backend under test (libhv for the client's base class)
+ 	g++ -std=gnu++17 -O2 -I./src -I./fmt/include -Ilibhv/include/ $(MMU_BACKEND_DEFS) $(MMU_BACKEND_SRC) \
+diff --git a/src/filament_prompt.h b/src/filament_prompt.h
+new file mode 100644
+--- /dev/null
++++ b/src/filament_prompt.h
+@@ -0,0 +1,51 @@
++#pragma once
++
++#include "hv/json.hpp"
++#include <cmath>
++#include <cstdint>
++#include <iomanip>
++#include <sstream>
++#include <string>
++
++namespace FilamentPrompt {
++
++// These are the titles used by the COSMOS loading macros. Other prompts keep
++// their existing layout, including unload, probing and third-party dialogs.
++inline bool matches(const std::string &title) {
++  return title == "Load Filament" || title == "Loading Filament" ||
++         title == "Finalizing filament load";
++}
++
++inline std::string status(const nlohmann::json &state, uint32_t elapsed_ms) {
++  auto temperature = [&state](const char *path) {
++    const auto ptr = nlohmann::json::json_pointer(path);
++    if (!state.contains(ptr) || !state[ptr].is_number()) return std::string("--");
++    const double value = state[ptr].get<double>();
++    if (!std::isfinite(value)) return std::string("--");
++    std::ostringstream text;
++    text << std::fixed << std::setprecision(0) << value;
++    return text.str();
++  };
++
++  std::string sensor = "Unavailable";
++  const auto sensor_ptr = nlohmann::json::json_pointer(
++    "/filament_switch_sensor filament_sensor");
++  if (state.contains(sensor_ptr) && state[sensor_ptr].is_object()) {
++    const auto &s = state[sensor_ptr];
++    if (s.contains("enabled") && s["enabled"].is_boolean()) {
++      if (!s["enabled"].get<bool>()) sensor = "Disabled";
++      else if (s.contains("filament_detected") && s["filament_detected"].is_boolean()) {
++        sensor = s["filament_detected"].get<bool>() ? "Detected" : "Not detected";
++      }
++    }
++  }
++
++  const auto seconds = elapsed_ms / 1000;
++  std::ostringstream text;
++  text << "Nozzle: " << temperature("/extruder/temperature")
++       << " °C / Target: " << temperature("/extruder/target") << " °C\n"
++       << "Filament sensor: " << sensor << "\nTime in step: "
++       << seconds / 60 << ':' << std::setfill('0') << std::setw(2) << seconds % 60;
++  return text.str();
++}
++}
+diff --git a/src/prompt_panel.h b/src/prompt_panel.h
+--- a/src/prompt_panel.h
++++ b/src/prompt_panel.h
+@@ -43,6 +43,8 @@
+ 
+         void foreground();
+         void background();
++        // Called under the LVGL lock when Klipper/Moonraker becomes unavailable.
++        void connection_lost();
+ 
+     private:
+         // dialogs klipper opens off printer status rather than action:prompt
+@@ -55,6 +57,8 @@
+         void open(KlipperDialog d, const std::string &title);
+         void clear();
+         void close();
++        void update_filament_state(const json &status);
++        void update_filament_status();
+         void update_manual_probe(json &mp);
+         void show_screws_tilt(json &st);
+ 
+@@ -79,6 +83,11 @@
+         std::string numpad_cmd;
+         bool prompt_shown = false;
+         lv_obj_t *error_label = NULL;
++        lv_obj_t *filament_status_label = NULL;
++        lv_timer_t *filament_status_timer = NULL;
++        bool filament_prompt = false;
++        uint32_t filament_step_started = 0;
++        json filament_state;
+ 
+ };
+ 
+diff --git a/src/prompt_panel.cpp b/src/prompt_panel.cpp
+--- a/src/prompt_panel.cpp
++++ b/src/prompt_panel.cpp
+@@ -5,6 +5,7 @@
+ #include "utils.h"
+ #include "logger.h"
+ #include "theme.h"
++#include "filament_prompt.h"
+ 
+ using namespace Theme;
+ 
+@@ -92,6 +93,14 @@
+   // create header
+   lv_label_set_text(header, "HEADER");
+ 
++  // Timer callbacks run under the application's LVGL lock. The small local
++  // snapshot is merged under that same lock by consume(), keeping the timer
++  // independent of the network thread updating the global State object.
++  filament_status_timer = lv_timer_create([](lv_timer_t *timer) {
++    static_cast<PromptPanel *>(timer->user_data)->update_filament_status();
++  }, 1000, this);
++  lv_timer_pause(filament_status_timer);
++
+   background(); // hide ourselves
+ }
+ 
+@@ -107,13 +116,17 @@
+ 
+   bool manual_probe = status.contains("manual_probe");
+   bool screws_tilt = status.contains("screws_tilt_adjust") && status["screws_tilt_adjust"].contains("results");
+-  if (!manual_probe && !screws_tilt) {
++  bool filament_update = status.contains("extruder") || status.contains("filament_switch_sensor filament_sensor");
++  if (!manual_probe && !screws_tilt && !filament_update) {
+     return;
+   }
+ 
+   // State consumes before us, so it holds the whole object, not just what changed
+   State *state = State::get_instance();
+   std::lock_guard<std::mutex> lock(lv_lock);
++  if (filament_update && filament_prompt) {
++    update_filament_state(status);
++  }
+   if (manual_probe) {
+     json mp = state->get_data("/printer_state/manual_probe"_json_pointer);
+     update_manual_probe(mp);
+@@ -329,6 +342,9 @@
+ }
+ 
+ PromptPanel::~PromptPanel() {
++  if (filament_status_timer != NULL) {
++    lv_timer_del(filament_status_timer);
++  }
+   if (prompt_cont != NULL) {
+     lv_obj_del(prompt_cont);
+     prompt_cont = NULL;
+@@ -343,6 +359,15 @@
+ 
+ void PromptPanel::background() {
+   lv_obj_move_background(prompt_cont);
++}
++
++void PromptPanel::connection_lost() {
++  if (filament_prompt) {
++    // An interrupted flow cannot safely resume from cached temperatures or
++    // old LOAD/Purge buttons. A new prompt will seed a fresh status snapshot.
++    restore_print_status_foreground_ = false;
++    close();
++  }
+ }
+ 
+ // a prompt taller than the screen takes the full height and scrolls its body,
+@@ -372,6 +397,10 @@
+ }
+ 
+ void PromptPanel::clear() {
++  lv_timer_pause(filament_status_timer);
++  filament_status_label = NULL;
++  filament_prompt = false;
++  filament_state = json::object();
+   lv_obj_clean(footer_cont);
+   lv_obj_clean(flex);
+   button_group_cont = NULL;
+@@ -383,6 +412,21 @@
+   numpad_cmd.clear();
+   prompt_shown = false;
+   error_label = NULL;
++}
++
++void PromptPanel::update_filament_state(const json &status) {
++  for (const char *object : {"extruder", "filament_switch_sensor filament_sensor"}) {
++    if (status.contains(object)) filament_state[object].merge_patch(status[object]);
++  }
++  update_filament_status();
++}
++
++void PromptPanel::update_filament_status() {
++  if (filament_status_label == NULL) return;
++  const auto text = FilamentPrompt::status(filament_state, lv_tick_elaps(filament_step_started));
++  if (text != lv_label_get_text(filament_status_label)) {
++    lv_label_set_text(filament_status_label, text.c_str());
++  }
+ }
+ 
+ void PromptPanel::close() {
+@@ -547,6 +591,8 @@
+ 
+         // set header here
+         lv_label_set_text(header, prompt_header.c_str());
++        filament_prompt = FilamentPrompt::matches(prompt_header);
++        filament_step_started = lv_tick_get();
+       } else if (command.find("prompt_text") == 0) {
+         std::string prompt_text = command.substr(12);
+         LOG_DEBUG("PROMPT_TEXT: {}", prompt_text);
+@@ -595,6 +641,13 @@
+         add_button(parent, prompt_footer_button, prompt_button_command, prompt_button_type);
+       } else if (command.find("prompt_show") == 0) {
+         LOG_DEBUG("PROMPT_SHOW");
++        if (filament_prompt && filament_status_label == NULL) {
++          filament_status_label = add_text("");
++          lv_obj_set_style_text_font(filament_status_label, scale_font(14), 0);
++          update_filament_state(State::get_instance()->get_data("/printer_state"_json_pointer));
++          lv_timer_reset(filament_status_timer);
++          lv_timer_resume(filament_status_timer);
++        }
+         restore_print_status_foreground_ = print_status_panel.is_foreground();
+         foreground();
+         fit_box();
+diff --git a/src/main_panel.cpp b/src/main_panel.cpp
+--- a/src/main_panel.cpp
++++ b/src/main_panel.cpp
+@@ -116,6 +116,7 @@
+   else {
+     lv_obj_add_state(print_status_panel.get_mini_status(), LV_STATE_DISABLED);
+     print_status_panel.background();
++    prompt_panel.connection_lost();
+     homing_panel.background();
+     extruder_panel.background();
+     fan_panel.background();
+diff --git a/tests/test_filament_prompt.cpp b/tests/test_filament_prompt.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test_filament_prompt.cpp
+@@ -0,0 +1,46 @@
++#include "filament_prompt.h"
++
++#include <cassert>
++#include <iostream>
++
++using json = nlohmann::json;
++
++int main() {
++  assert(FilamentPrompt::matches("Load Filament"));
++  assert(FilamentPrompt::matches("Loading Filament"));
++  assert(FilamentPrompt::matches("Finalizing filament load"));
++  assert(!FilamentPrompt::matches("Unload completed"));
++  assert(!FilamentPrompt::matches("Manual Probe"));
++
++  json state = {
++    {"extruder", {{"temperature", 147.2}, {"target", 220.0}}},
++    {"filament_switch_sensor filament_sensor",
++      {{"enabled", true}, {"filament_detected", false}}}
++  };
++  assert(FilamentPrompt::status(state, 65000) ==
++         "Nozzle: 147 °C / Target: 220 °C\n"
++         "Filament sensor: Not detected\nTime in step: 1:05");
++
++  // A target-only delta must retain the last measured temperature.
++  state.merge_patch({{"extruder", {{"target", 240}}}});
++  assert(FilamentPrompt::status(state, 0).find(
++    "Nozzle: 147 °C / Target: 240 °C") == 0);
++  state["filament_switch_sensor filament_sensor"]["filament_detected"] = true;
++  assert(FilamentPrompt::status(state, 1999).find(
++    "Filament sensor: Detected\nTime in step: 0:01") != std::string::npos);
++
++  // Disabled, absent and unknown data must not claim a healthy detection.
++  state["filament_switch_sensor filament_sensor"]["enabled"] = false;
++  assert(FilamentPrompt::status(state, 0).find("Filament sensor: Disabled")
++         != std::string::npos);
++  assert(FilamentPrompt::status(json::object(), 0) ==
++         "Nozzle: -- °C / Target: -- °C\n"
++         "Filament sensor: Unavailable\nTime in step: 0:00");
++  assert(FilamentPrompt::status(nullptr, 0).find("Nozzle: --") == 0);
++  state["extruder"] = {{"temperature", "invalid"}, {"target", nullptr}};
++  state["filament_switch_sensor filament_sensor"] = {{"enabled", true}};
++  assert(FilamentPrompt::status(state, 0).find("Nozzle: -- °C / Target: -- °C") == 0);
++  assert(FilamentPrompt::status(state, 0).find("Filament sensor: Unavailable")
++         != std::string::npos);
++  std::cout << "Filament prompt tests passed\n";
++}
