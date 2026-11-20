@@ -61,6 +61,26 @@ Choose the appropriate image type based on your target boot media:
 
 ## How to Build
 
+### Build the combined CC1 UI test on GitHub
+
+The `test/cc1-filament-and-leveling` branch includes a separate GitHub-hosted
+workflow, **Build CC1 UI test firmware**. Pushing that branch runs the build
+on GitHub's Ubuntu runner instead of requiring a local Yocto installation or
+the upstream project's self-hosted runner.
+
+Open the workflow run under Actions. After a successful run, download
+`centauri-carbon-1-ui-test-firmware` from its artifacts and extract the
+`cosmos-centauri-carbon-1.swu` file. The artifact also contains a SHA-256
+checksum and the exact source/submodule revisions. Artifacts are retained
+for seven days. The workflow builds only CC1 and does not publish a release.
+
+The first build can take several hours. Downloads and completed shared-state
+tasks are cached; if the build reaches its five-hour build-step limit, rerun
+the job to continue from available cached work. Failed runs upload build
+diagnostics separately as `cc1-ui-test-build-logs`.
+
+### Build locally
+
 1. **Initialize the build environment:**
    Source the environment setup script provided by Openembedded Core to prepare your shell for BitBake.
    ```bash
