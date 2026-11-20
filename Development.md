@@ -193,12 +193,19 @@ The Manual Leveling prompt uses the same `screws_tilt_adjust.results` values
 as the web interface. Leave the screw marked `BASE` unchanged, then turn the
 other screws by their reported CW/CCW amounts as viewed from above. The amount
 is full turns followed by clock minutes: `01:20` means one turn plus 20/60 of
-a turn. Hold the bottom with a 2.5 mm hex key while adjusting from the top.
+a turn; `00:02` means 2/60 of a turn. Hold the bottom with a 2.5 mm hex key
+while adjusting from the top, then select Retry to measure again.
 
 The prompt no longer recalculates every screw against an absolute bed-height
 target. Its shorter rows show the corner, direction and amount, with the
 reference screw clearly identified. Retry and Done retain their existing
 calibration and bed-mesh actions.
+
+This deliberately changes manual leveling to use the web dialog's relative
+tilt adjustments. The upstream COSMOS prompt also targets an absolute bed
+height for probing; that separate height target is not applied by this flow.
+The printer must show the reference screw, turn direction and turn amount
+directly so the operator can level it without relying on a computer.
 
 Run the macro regression tests from the repository root with Python and Jinja2:
 

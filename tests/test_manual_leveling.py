@@ -78,6 +78,18 @@ class ManualLevelingPrompt(unittest.TestCase):
         self.assertEqual(rows[0], "Front right: CW 01:20")
         self.assertEqual(rows[2], "Rear left: BASE - leave unchanged")
 
+    def test_retry_shows_latest_small_and_zero_adjustments(self):
+        self.rows()  # Initial results must not be reused after a retry.
+        self.results["screw2"].update(sign="CW", adjust="00:02")
+        self.results["screw3"].update(sign="CCW", adjust="00:01")
+        self.results["screw4"].update(sign="CW", adjust="00:00")
+        self.assertEqual(self.rows(), [
+            "Front right: BASE - leave unchanged",
+            "Rear right: CW 00:02",
+            "Rear left: CCW 00:01",
+            "Front left: CW 00:00",
+        ])
+
     def test_calibration_retains_close_and_retry_actions(self):
         messages = self.render(CALIBRATION="TRUE", BED_TEMP=70)
         self.assertIn("action:prompt_footer_button Done|_CLOSE_PROMPT", messages)
