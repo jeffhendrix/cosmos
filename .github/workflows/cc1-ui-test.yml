@@ -69,7 +69,7 @@ jobs:
         run: |
           set -eo pipefail
           # The distro config loads after local.conf, so set the test version here.
-          sed -i 's/^DISTRO_VERSION = ".*"/DISTRO_VERSION = "26.10.1-t1"/' \
+          sed -i 's/^DISTRO_VERSION = ".*"/DISTRO_VERSION = "26.10.1-t2"/' \
             meta-opencentauri/conf/distro/cosmos.conf
           export TEMPLATECONF="$GITHUB_WORKSPACE/meta-opencentauri/conf/templates/opencentauri"
           source openembedded-core/oe-init-build-env build
@@ -84,7 +84,7 @@ jobs:
           git -C "$GITHUB_WORKSPACE" rev-parse HEAD > source-commit.txt
           git -C "$GITHUB_WORKSPACE" submodule status > source-submodules.txt
           bitbake-getvar --value DISTRO_VERSION | tee distro-version.txt
-          test "$(cat distro-version.txt)" = "26.10.1-t1"
+          test "$(cat distro-version.txt)" = "26.10.1-t2"
           df -h .
 
       - name: Build CC1 firmware
