@@ -17,7 +17,7 @@ SRC_URI = "gitsm://github.com/pellcorp/grumpyscreen.git;protocol=https;branch=ma
 "
 
 SRCREV = "33a3e576076e8a7c436fbd7c534cd73af7fe4c44"
-PR = "322"
+PR = "323"
 
 RDEPENDS:${PN} = " \
     klipper \
