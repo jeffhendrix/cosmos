@@ -4,8 +4,9 @@ Subject: [PATCH] Show live status on filament-loading prompts
 Keep nozzle/target temperatures, filament-switch state and step time visible
 while COSMOS loading prompts are open. Refresh a small local status snapshot
 from Moonraker deltas under the LVGL lock, and update the elapsed time once
-per second without rebuilding the prompt or its buttons. Close interrupted
-loading prompts when Klipper or Moonraker disconnects to discard stale data.
+per second without rebuilding the prompt or its buttons. Ignore null fields
+inserted by earlier consumers when they inspect omitted notification fields.
+Close interrupted loading prompts on Klipper or Moonraker disconnects.
 
 Upstream-Status: Inappropriate [COSMOS-specific filament-loading prompts]
 
@@ -25,7 +26,7 @@ diff --git a/src/filament_prompt.h b/src/filament_prompt.h
 new file mode 100644
 --- /dev/null
 +++ b/src/filament_prompt.h
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,62 @@
 +#pragma once
 +
 +#include "hv/json.hpp"
@@ -36,6 +37,17 @@ new file mode 100644
 +#include <string>
 +
 +namespace FilamentPrompt {
++
++inline void merge_status(nlohmann::json &cached, const nlohmann::json &status) {
++  for (const char *object : {"extruder", "filament_switch_sensor filament_sensor"}) {
++    if (!status.contains(object) || !status[object].is_object()) continue;
++    // Other consumers use operator[] on shared notifications, adding null for
++    // omitted fields. Those are not deletions; keep the last known reading.
++    for (const auto &field : status[object].items()) {
++      if (!field.value().is_null()) cached[object][field.key()] = field.value();
++    }
++  }
++}
 +
 +// These are the titles used by the COSMOS loading macros. Other prompts keep
 +// their existing layout, including unload, probing and third-party dialogs.
@@ -192,16 +204,14 @@ diff --git a/src/prompt_panel.cpp b/src/prompt_panel.cpp
    lv_obj_clean(footer_cont);
    lv_obj_clean(flex);
    button_group_cont = NULL;
-@@ -383,6 +412,21 @@
+@@ -383,6 +412,19 @@
    numpad_cmd.clear();
    prompt_shown = false;
    error_label = NULL;
 +}
 +
 +void PromptPanel::update_filament_state(const json &status) {
-+  for (const char *object : {"extruder", "filament_switch_sensor filament_sensor"}) {
-+    if (status.contains(object)) filament_state[object].merge_patch(status[object]);
-+  }
++  FilamentPrompt::merge_status(filament_state, status);
 +  update_filament_status();
 +}
 +
@@ -214,7 +224,7 @@ diff --git a/src/prompt_panel.cpp b/src/prompt_panel.cpp
  }
  
  void PromptPanel::close() {
-@@ -547,6 +591,8 @@
+@@ -547,6 +589,8 @@
  
          // set header here
          lv_label_set_text(header, prompt_header.c_str());
@@ -223,7 +233,7 @@ diff --git a/src/prompt_panel.cpp b/src/prompt_panel.cpp
        } else if (command.find("prompt_text") == 0) {
          std::string prompt_text = command.substr(12);
          LOG_DEBUG("PROMPT_TEXT: {}", prompt_text);
-@@ -595,6 +641,13 @@
+@@ -595,6 +639,13 @@
          add_button(parent, prompt_footer_button, prompt_button_command, prompt_button_type);
        } else if (command.find("prompt_show") == 0) {
          LOG_DEBUG("PROMPT_SHOW");
@@ -252,7 +262,7 @@ diff --git a/tests/test_filament_prompt.cpp b/tests/test_filament_prompt.cpp
 new file mode 100644
 --- /dev/null
 +++ b/tests/test_filament_prompt.cpp
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,75 @@
 +#include "filament_prompt.h"
 +
 +#include <cassert>
@@ -275,6 +285,35 @@ new file mode 100644
 +  assert(FilamentPrompt::status(state, 65000) ==
 +         "Nozzle: 147 °C / Target: 220 °C\n"
 +         "Filament sensor: Not detected\nTime in step: 1:05");
++
++  // Existing consumers inspect absent fields with non-const operator[],
++  // inserting null into the shared notification before this panel sees it.
++  json cached = state;
++  json update = {{"params", json::array({
++    {{"extruder", {{"temperature", 148.0}}}}
++  })}};
++  auto missing_target = update["/params/0/extruder/target"_json_pointer];
++  assert(missing_target.is_null());
++  FilamentPrompt::merge_status(cached, update["params"][0]);
++  assert(FilamentPrompt::status(cached, 0).find(
++    "Nozzle: 148 °C / Target: 220 °C") == 0);
++
++  update = {{"params", json::array({
++    {{"extruder", {{"target", 240.0}}}}
++  })}};
++  auto missing_temperature = update["/params/0/extruder/temperature"_json_pointer];
++  assert(missing_temperature.is_null());
++  FilamentPrompt::merge_status(cached, update["params"][0]);
++  assert(FilamentPrompt::status(cached, 0).find(
++    "Nozzle: 148 °C / Target: 240 °C") == 0);
++
++  // Genuine zero/false updates must still replace cached non-zero values.
++  FilamentPrompt::merge_status(cached, {
++    {"extruder", {{"target", 0}}},
++    {"filament_switch_sensor filament_sensor", {{"enabled", false}}}
++  });
++  assert(FilamentPrompt::status(cached, 0).find("Target: 0 °C") != std::string::npos);
++  assert(FilamentPrompt::status(cached, 0).find("Filament sensor: Disabled") != std::string::npos);
 +
 +  // A target-only delta must retain the last measured temperature.
 +  state.merge_patch({{"extruder", {{"target", 240}}}});
